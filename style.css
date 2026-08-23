@@ -1,0 +1,11 @@
+<style>
+.shift-card { font-size: 12px; cursor: pointer; }
+.shift-card:hover { transform: scale(1.02); }
+
+/* NEW: only grey background, keep text readable */
+.past-day { 
+    background-color: #f1f3 !important; 
+    color: #212529 !important; /* force dark text */
+}
+.past-day small, .past-day .badge { opacity: 0.7; }
+</style>
