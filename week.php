@@ -1,6 +1,6 @@
 <?php
 require 'config.php';
-session_start(); // на всякий случай если не в config
+if (session_status() === PHP_SESSION_NONE) { session_start(); } // fixed double session
 checkAdmin();
 
 $business_id = $_SESSION['business_id'];
@@ -40,6 +40,45 @@ function getHours($start, $end){
     $diff = $end_ts - $start_ts;
     return $diff > 0? round($diff / 3600, 2) : 0;
 }
+
+// ===== TELEGRAM HELPERS - ONLY ADDITION - DO NOT REMOVE =====
+if(!function_exists('sendTelegramMsg')){
+function sendTelegramMsg($chat_id, $text, $keyboard = null){
+    if(!defined('TELEGRAM_BOT_TOKEN')) return;
+    $token = TELEGRAM_BOT_TOKEN;
+    $url = "https://api.telegram.org/bot$token/sendMessage";
+    $data = ['chat_id' => $chat_id, 'text' => $text, 'parse_mode' => 'HTML'];
+    if($keyboard) $data['reply_markup'] = json_encode($keyboard);
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+    curl_exec($ch);
+    curl_close($ch);
+}
+}
+if(!function_exists('getFreeEmployeesForTelegram')){
+function getFreeEmployeesForTelegram($conn, $business_id, $date, $start, $end){
+    // supports both telegram_id and telegram_chat_id columns
+    $sql = "SELECT telegram_chat_id, telegram_id FROM users
+            WHERE business_id=? AND role='employee'
+            AND (telegram_chat_id IS NOT NULL OR telegram_id IS NOT NULL)
+            AND NOT EXISTS (
+                SELECT 1 FROM shifts s WHERE s.employee_id=users.id AND s.shift_date=?
+                AND ((s.start_time <? AND s.end_time >?) OR (s.start_time <? AND s.end_time >?))
+            )";
+    $stmt = $conn->prepare($sql);
+    $stmt->execute([$business_id, $date, $end, $start, $end, $start]);
+    $ids = [];
+    while($r = $stmt->fetch()){
+        $tg = $r['telegram_chat_id']?? $r['telegram_id'];
+        if($tg) $ids[] = $tg;
+    }
+    return array_unique($ids);
+}
+}
+// ===== END TELEGRAM HELPERS =====
 
 // Get data - ADDED hourly_rate
 $employees = $conn->prepare("SELECT * FROM users WHERE business_id =? AND role = 'employee' ORDER BY name");
@@ -112,25 +151,26 @@ if(isset($_POST['add_shift']) && hash_equals($_SESSION['csrf'], $_POST['csrf']))
     header("Location: week.php?week=$monday"); exit();
 }
 
-// NEW: ACTION TO POST OPEN SHIFT + TELEGRAM NOTIFY
+// NEW: ACTION TO POST OPEN SHIFT + TELEGRAM NOTIFY - EDITED ONLY HERE
 if(isset($_POST['post_open_shift']) && hash_equals($_SESSION['csrf'], $_POST['csrf'])){
-    $slots = max(1, intval($_POST['os_slots'])); // CHANGED: cannot be less than 1
-    $stmt = $conn->prepare("INSERT INTO open_shifts (business_id, shift_date, start_time, end_time, role, pay, slots_total) VALUES (?,?,?,?,?,?,?)"); // CHANGED: bonus -> pay. Keep column name pay in DB
-    $stmt->execute([$business_id, $_POST['os_date'], $_POST['os_start'], $_POST['os_end'], $_POST['os_role'], $_POST['os_pay'], $slots]); // CHANGED: os_bonus -> os_pay
-    
-    // NEW: Send Telegram notification to all employees with telegram_id
-    $emps = $conn->prepare("SELECT telegram_id FROM users WHERE business_id=? AND role='employee' AND telegram_id IS NOT NULL");
-    $emps->execute([$business_id]);
-    $msg = "🚨 <b>New Open Shift</b>\n📅 Date: ".date('d.m',strtotime($_POST['os_date']))."\n⏰ Time: ".$_POST['os_start']."-".$_POST['os_end']."\n👤 Role: ".e($_POST['os_role'])."\n💰 Bonus: ".$_POST['os_pay']." ₽\n\nOpen the website to take it";
-    while($e = $emps->fetch()){
-        sendTelegram($e['telegram_id'], $msg);
+    $slots = max(1, intval($_POST['os_slots']));
+    $stmt = $conn->prepare("INSERT INTO open_shifts (business_id, shift_date, start_time, end_time, role, pay, slots_total, slots_taken, status) VALUES (?,?,?,?,?,?,?,?, 'open')");
+    $stmt->execute([$business_id, $_POST['os_date'], $_POST['os_start'], $_POST['os_end'], $_POST['os_role'], $_POST['os_pay'], $slots, 0]);
+    $new_os_id = $conn->lastInsertId();
+
+    // NEW LOGIC: Send to only free employees + buttons for accept/cancel + filled handling is in webhook
+    $free_tg_ids = getFreeEmployeesForTelegram($conn, $business_id, $_POST['os_date'], $_POST['os_start'], $_POST['os_end']);
+    $msg = "🚨 <b>NEW SHIFT OPEN</b> 🚨\n\n📅 Date: ".date('d.m',strtotime($_POST['os_date']))."\n⏰ Time: ".$_POST['os_start']."-".$_POST['os_end']."\n👤 Role: ".e($_POST['os_role'])."\n💰 Bonus: ".$_POST['os_pay']." ₽\n🎫 Slots: {$slots}\n\nНажми чтобы взять смену:";
+    $keyboard = ['inline_keyboard' => [[['text' => '✅ TAKE SHIFT', 'callback_data' => "accept_{$new_os_id}"]]]];
+    foreach($free_tg_ids as $tg_id){
+        sendTelegramMsg($tg_id, $msg, $keyboard);
     }
-    
-    setFlash('success', 'Открытая смена опубликована!');
+
+    setFlash('success', 'Открытая смена опубликована! Telegram отправлен '.count($free_tg_ids).' свободным сотрудникам.');
     header("Location: week.php?week=$monday"); exit();
 }
 
-// FIXED DELETE BLOCK
+// FIXED DELETE BLOCK - ONLY ADDED TELEGRAM REOPEN AT END
 if(isset($_GET['delete']) &&!empty($_GET['delete'])){
     $shift_id = intval($_GET['delete']);
 
@@ -148,7 +188,7 @@ if(isset($_GET['delete']) &&!empty($_GET['delete'])){
     } else {
         // 2. FIX: Find if this shift came from open_shift by matching date+time, not by application
         $find_os = $conn->prepare("
-            SELECT id as open_shift_id, role FROM open_shifts
+            SELECT id as open_shift_id, role, pay FROM open_shifts
             WHERE shift_date=? AND start_time=? AND end_time=? AND business_id=?
             LIMIT 1
         ");
@@ -162,13 +202,21 @@ if(isset($_GET['delete']) &&!empty($_GET['delete'])){
             // Remove application so employee can take it again
             $conn->prepare("DELETE FROM open_shift_applications WHERE open_shift_id=? AND staff_id=?")->execute([$os_data['open_shift_id'], $shift['employee_id']]);
 
-            // NEW: Notify all OTHER employees that slot is available
+            // NEW: Notify all OTHER employees that slot is available (internal)
             $msg_available = "🚨 Доступна смена: ".date('d.m',strtotime($shift['shift_date']))." ".$shift['start_time']."-".$shift['end_time']." ".$os_data['role'];
             $notify_all = $conn->prepare("SELECT id FROM users WHERE business_id=? AND role='employee' AND id!=?");
             $notify_all->execute([$business_id, $shift['employee_id']]);
             $ins_notif = $conn->prepare("INSERT INTO shift_notifications (user_id, business_id, message) VALUES (?,?,?)");
             while($emp = $notify_all->fetch()){
                 $ins_notif->execute([$emp['id'], $business_id, $msg_available]);
+            }
+
+            // NEW: Telegram reopen broadcast to free employees
+            $free_tg_ids = getFreeEmployeesForTelegram($conn, $business_id, $shift['shift_date'], $shift['start_time'], $shift['end_time']);
+            $tg_msg = "♻️ <b>1 SLOT REOPENED!</b>\n📅 ".date('d.m',strtotime($shift['shift_date']))." {$shift['start_time']}-{$shift['end_time']}\n👤 {$os_data['role']}\nSomeone cancelled - slot free again!";
+            $keyboard = ['inline_keyboard' => [[['text' => '✅ TAKE SHIFT', 'callback_data' => "accept_{$os_data['open_shift_id']}"]]]];
+            foreach($free_tg_ids as $tg_id){
+                sendTelegramMsg($tg_id, $tg_msg, $keyboard);
             }
         }
 
@@ -207,6 +255,7 @@ $colors = ['info','success'];
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <title>Расписание - ShiftPro</title>
 <style>
 :root{
@@ -219,11 +268,11 @@ $colors = ['info','success'];
 body{ background: var(--bg); font-family: 'Inter', sans-serif; color: var(--text);}
 .navbar{ backdrop-filter: blur(10px); background: rgba(17,24,39,0.95)!important; }
 
-.shift-card { 
-    font-size: 12px; 
-    border-radius: 12px; 
+.shift-card {
+    font-size: 12px;
+    border-radius: 12px;
     border: 1px solid var(--border);
-    transition: all .2s;
+    transition: all.2s;
     color: var(--text);
 }
 .shift-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.06); }
@@ -234,8 +283,8 @@ body{ background: var(--bg); font-family: 'Inter', sans-serif; color: var(--text
 
 /* FIXED: Past days with proper contrast */
 .past-day { background-color: #e5e7eb!important; color: #111827!important; }
-.past-day .shift-card{ opacity: 0.85; }
-.past-day .text-muted{ color: #4b5563!important; }
+.past-day.shift-card{ opacity: 0.85; }
+.past-day.text-muted{ color: #4b5563!important; }
 
 .open-shift-card { border: 2px dashed #ef4444; background: #fef2f2; border-radius: 12px; }
 .notif-dropdown { max-height: 400px; overflow-y: auto; width: 380px; border-radius: 12px; }
@@ -407,7 +456,7 @@ body{ background: var(--bg); font-family: 'Inter', sans-serif; color: var(--text
                                         }
                                     }
                                 }
-                      ?>
+                     ?>
                             <div class="p-2 mb-2 shift-card shift-<?= $color?>">
                                 <div class="d-flex justify-content-between">
                                     <b>План:</b> <span><?= date('H:i', strtotime($s['start_time']))?>-<?= date('H:i', strtotime($s['end_time']))?></span>
